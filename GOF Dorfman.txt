@@ -1,0 +1,127 @@
+############################################
+# GOF test for D=2 under Dorfman testing
+# X_1=X_2=T_1=T_2
+
+GOF.MTGT<-function(model.fit,data,iter){
+
+res<-model.fit
+Y<-data$Y
+X<-data$X
+p<-dim(X[[1]])[2]
+N<-dim(Y)[1]
+T<-X
+D<-2
+
+iter.seq<-seq(iter/2,iter,by=100)
+jiter.l<-length(iter.seq)
+
+P1.mat<-matrix(-99,nrow=jiter.l,ncol=N)
+P2.mat<-matrix(-99,nrow=jiter.l,ncol=N)
+
+for(jiter in 1:jiter.l){
+
+iter<-iter.seq[jiter]
+
+beta.list<-list()
+beta.list[[1]]<-res$beta[iter,1:p]
+beta.list[[2]]<-res$beta[iter,(p+1):(2*p)]
+
+V.list<-list()
+V.list[[1]]<-diag(res$lambda[iter,1:p])
+V.list[[2]]<-diag(res$lambda[iter,(p+1):(2*p)])
+
+A.list<-list()
+A.list[[1]] = diag(p)
+A.list[[1]][lower.tri(A.list[[1]])] = 0.01
+A.list[[2]] = diag(p)
+A.list[[2]][lower.tri(A.list[[2]])] = 0.01
+tmp = as.relistable(A.list)
+tmp1 = unlist(tmp)
+ali = which(tmp1 != 0 & tmp1 != 1)
+tmp1[ali] = res$a[iter,]
+A.list = relist(tmp1)
+
+b.list<-list()
+b.list[[1]]<-res$b[,1:p,iter]
+b.list[[2]]<-res$b[,(p+1):(2*p),iter]
+
+qd = unlist(lapply(1:D,function(t){dim(T[[t]])[2]}))
+
+XB = do.call(cbind,lapply(1:D, listiply, L1 = X, L2 = beta.list))
+TV = lapply(1:D, listiply, L1 = T, L2 = V.list)
+TVA = lapply(1:D, listiply, L1 = TV, L2 = A.list)
+TVAb = matrix(0, N, D)
+
+TVAb<-matrix(-99, N, D)
+for(i in 1:N){
+bid<-Y[i,D+2]
+TVAb[i,1]<-sum(TVA[[1]][i,]*b.list[[1]][bid,])
+TVAb[i,2]<-sum(TVA[[2]][i,]*b.list[[2]][bid,])
+}
+
+eta = XB + TVAb
+
+marg1 = pnorm(eta[,1])
+marg2 = pnorm(eta[,2])
+
+P1.mat[jiter,]<-marg1
+P2.mat[jiter,]<-marg2
+
+}
+
+
+p1.est<-apply(P1.mat,2,mean)
+p2.est<-apply(P2.mat,2,mean)
+pid<-Y[,5]
+
+#########
+# Need based on MCMC results in res column 1(2) disease 1(2) pool row 1 ind row2
+Se<-apply(res$se[,,iter.seq],c(1,2),mean)
+Sp<-apply(res$sp[,,iter.seq],c(1,2),mean)
+
+sim<-5000
+pred.mat1<-matrix(-99,nrow=sim,ncol=N)
+pred.mat2<-matrix(-99,nrow=sim,ncol=N)
+
+set.seed(123456)
+for(s in 1:sim){
+res<-MRGT.Dorfman.decode.resamp(D=2, p1=p1.est, p2=p2.est, pid=pid, Se=Se, Sp=Sp, Yd=Y)$Y
+pred.mat1[s,]<-res[,1]
+pred.mat2[s,]<-res[,2]
+print(s)
+}
+
+p1<-apply(pred.mat1,2,mean)
+p2<-apply(pred.mat2,2,mean)
+
+Y1<-Y[,1]
+Y2<-Y[,2]
+
+res1<-hoslem.test(Y1, p1)
+res2<-hoslem.test(Y2, p2)
+return(list("r1"=res1,"r2"=res2))
+}
+
+MRGT.Dorfman.decode.resamp = function(D, p1, p2, pid, Se, Sp, Yd){
+	
+        N = length(p1)
+        Yt = cbind(rbinom(N,1,p1),rbinom(N,1,p2))
+	Y =  matrix(-99,nrow=N,ncol=2)
+        upid<-unique(pid)
+        J = length(upid)
+
+	for(j in 1:J){
+	   id = which(pid==upid[j])
+
+		prob = ifelse(apply(Yt[id,],2,sum) > 0, Se[1,], 1 - Sp[1,])
+		Z = rbinom(D, 1, prob)
+		Y[id, ] = 0  
+		  if(sum(Z) > 0){
+			for(k in id){
+				prob = ifelse(Yt[k,] > 0, Se[2,], 1 - Sp[2,])
+				Y[k,] = rbinom(D, 1, prob)
+	        }}
+               	}
+	return(list("Y" = Y))
+}
+

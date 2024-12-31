@@ -1,0 +1,3 @@
+# The code provided here implements the methods developed in the corresponding manuscript to analyze a simulated data set.
+# The main file is "Sim File.txt". In this file we make calls to functions that simulate group testing data, calls to functions that analyze that data, and then we summarize the results.
+# See "Sim File.txt" for further discussion.

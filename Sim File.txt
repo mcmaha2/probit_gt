@@ -1,0 +1,93 @@
+##########################################################################################
+# Set the working directory
+setwd("C://Users//mcmaha2//OneDrive - Clemson University//Desktop//MTGT Code for Webpage")
+
+#########################
+# Load packages and files
+library(mvtnorm)
+library(CholWishart)
+library(mnormt)
+library(truncnorm)
+library(Matrix)
+library(ResourceSelection)
+source("data_gen.txt")
+source("Supports-Dirac-Recode-Final-Clean.txt")
+source("GOF Dorfman.txt")
+Rcpp::sourceCpp("createTVAb.cpp")
+
+
+##########################################################
+## Specify uninformative priors for Se and Sp
+
+D1.ase<-c(1, 1)
+D1.bse<-c(1, 1)
+D1.asp<-c(1, 1)
+D1.bsp<-c(1, 1)
+
+D2.ase<-c(1, 1)
+D2.bse<-c(1, 1)
+D2.asp<-c(1, 1)
+D2.bsp<-c(1, 1)
+
+ase = cbind(D1.ase,D2.ase)
+bse = cbind(D1.bse,D2.bse)
+asp = cbind(D1.asp,D2.asp)
+bsp = cbind(D1.bsp,D2.bsp)
+
+# Initialize Se and Sp
+Se0 = rbind(c(0.95,0.95),c(0.95,0.95))
+Sp0 = rbind(c(0.95,0.95),c(0.95,0.95))
+
+######################################################################
+# Set priors for correlation matrix and proposal degrees of freedom
+mS = diag(2)		## W prior scale matrix
+m0 = 2+1		## W prior degrees of freedom
+m = 500			## W proposal degrees of freedom
+iters<-100000
+
+#################################################################################
+# Reads in a function that can be used to simulate multiplex Group testing data
+source("Supports-Dirac-Recode-Final-Clean.txt")
+
+# Generate data
+set.seed(123456)
+data<-data.gen()
+Z<-data$Z
+Y<-data$Y
+X<-data$X
+T<-data$T
+
+# Fit the model
+model.fit<-MRGT(Z=Z, Y=Y, X=X, T=X, D=2, Se=Se0, Sp=Sp0, ase=ase, bse=bse, asp=asp, bsp=bsp, mS=mS, m0=m0, m=m, iters = iters, est.error = TRUE, verbose = FALSE)
+
+
+#############################################################
+# Posterior summary
+
+range = seq(floor(iters/2),iters,10)
+res<-model.fit
+beta.est = apply(res$beta[range,],2,mean)
+beta.sd = apply(res$beta[range,],2,sd)
+beta.PI = apply(res$v[range,],2,mean)
+
+lambda.est = apply(res$lambda[range,],2,mean)
+lambda.sd = apply(res$lambda[range,],2,sd)
+lambda.PI = apply(res$w[range,],2,mean)
+
+a.est = apply(res$a[range,], 2, mean)
+a.sd = apply(res$a[range,], 2, sd)
+
+se.est = apply(res$se[,,range],c(1,2),mean)
+se.sd = apply(res$se[,,range],c(1,2),sd)
+
+sp.est = apply(res$sp[,,range],c(1,2),mean)
+sp.sd = apply(res$sp[,,range],c(1,2),sd)
+
+R.est = mean(res$R[1,2,range])
+R.sd = sd(res$R[1,2,range])
+
+
+#############################################################
+# GOF assessment
+
+GOF.MTGT(model.fit,data,iters)

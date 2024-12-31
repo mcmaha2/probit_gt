@@ -1,0 +1,74 @@
+
+data.gen<-function(N=10000,K=50,c=4,D=2){
+
+	## Design matrices ##
+	X = list()
+	x1 = cbind(rnorm(N), rbinom(N,1,0.5), rnorm(N),rbinom(N,1,0.5))
+	#x2 = cbind(rnorm(N), rnorm(N), rnorm(N))
+        x2 = x1
+	x1std = t((t(x1) - apply(x1,2,mean)) / apply(x1,2,sd))
+	x2std = t((t(x2) - apply(x2,2,mean)) / apply(x2,2,sd))
+	X[[1]] = cbind(1, x1std)
+	X[[2]] = cbind(1, x2std)
+	T = list()
+	t1std = x1std
+	t2std = x2std
+	T[[1]] = cbind(1, t1std)
+	T[[2]] = cbind(1, t2std)
+
+	## True parameters -- lists ##
+	beta1.truth = c(-2.0, -0.75, 0.5, 0.0,  0.00) 
+        beta2.truth = c(-2.5,  0, 0.0, 0.5, -0.25)
+	p1 = length(beta1.truth) 
+        p2 = length(beta2.truth) 
+        pd = c(p1, p2) 
+        p = sum(pd)
+
+	lambda1.truth = c(1, 0.75, 0.25, 0, 0) 
+        lambda2.truth = c(1, 0.75, 0.25, 0, 0)
+	q1 = length(lambda1.truth) 
+        q2 = length(lambda2.truth) 
+        qd = c(q1, q2) 
+        q = sum(qd)
+	
+        V1.truth = diag(lambda1.truth)
+        V2.truth = diag(lambda2.truth)
+	A1.truth = diag(q1) 
+        A2.truth = diag(q2)
+	A1.truth[lower.tri(A1.truth)] = c(0.5,0.2,0.1,0,0.5,0.2,0.1,0.5,0.2,0.5) 
+        A2.truth[lower.tri(A2.truth)] = c(0.5,0.2,0.1,0,0.5,0.2,0.1,0.5,0.2,0.5)
+	
+        beta.truth.list = list(beta1.truth, beta2.truth)
+	V.truth.list = list(V1.truth, V2.truth)
+	A.truth.list = list(A1.truth, A2.truth)
+	b.truth.list = list()
+	b.truth.list[[1]] = rmnorm(K, rep(0,qd[1]), diag(qd[1]))
+	b.truth.list[[2]] = rmnorm(K, rep(0,qd[2]), diag(qd[2]))
+	R.truth = matrix(c(1,0.6,0.6,1),2,2)
+	Se.truth = rbind(c(0.95,0.95),c(0.98,0.98))	## column 1 is disease 1, column 2 is disease 2
+	Sp.truth = rbind(c(0.98,0.98),c(0.99,0.99))
+
+	## Generate data ##
+	sid = sample(1:K, N, replace = TRUE)
+	XB.truth = do.call(cbind,lapply(1:D, listiply, L1 = X, L2 = beta.truth.list))
+	TV = lapply(1:D, listiply, L1 = T, L2 = V.truth.list)
+	TVA = lapply(1:D, listiply, L1 = TV, L2 = A.truth.list)
+	TVAb = matrix(0, N, D)
+	TVAb.truth = createTVAb(N,D,qd,TVAb,TVA,b.truth.list,sid)
+	eta.truth = XB.truth + TVAb.truth
+	h.truth = t(apply(eta.truth, 1, rmvtnorm.alt, s = R.truth))
+	Y.truth = matrix(as.numeric(h.truth>0), N, D)
+
+        #apply(Y.truth,2,mean)
+
+	## Group testing algorithm ##
+	data = MRGT.Dorfman.decode.diff.error(N,D,Y.truth,Se.truth,Sp.truth,c)
+        	
+	Z = data$Z
+        Y = data$Y
+	Y[,D+2] = sid
+
+return(list("Z"=Z, "X"=X, "Y"=Y, "T"=T))
+}
+
+

@@ -1,0 +1,969 @@
+###################################################################################################
+###################################################################################################
+#####
+#####	Final version of recode
+#####
+###################################################################################################
+###################################################################################################
+MRGT = function(Z, Y, X, T, D, Se, Sp, ase, bse, asp, bsp, mS, m0, m, iters = 25000, est.error = TRUE, verbose = FALSE){
+
+##############################
+## Load necessary functions ##
+Rcpp::sourceCpp("samplelatentstatuses.cpp")
+#Rcpp::sourceCpp("errorupdate.cpp")
+Rcpp::sourceCpp("createTVAb.cpp")
+Rcpp::sourceCpp("createTVb.cpp")
+Rcpp::sourceCpp("createE.cpp")
+Rcpp::sourceCpp("createU.cpp")
+
+#############################
+## Load necessary Packages ##
+library(lme4)
+library(mvtnorm)
+library(CholWishart)
+library(mnormt)
+library(truncnorm)
+library(Matrix)
+
+
+## Preliminaries ##
+N = dim(Y)[1]			                            ## total sample size
+K = length(unique(Y[,D+2]))		                            ## number of sites
+J = dim(Z)[1]
+pd = unlist(lapply(1:D,function(t){dim(X[[t]])[2]}))        ## number of fixed effects
+qd = unlist(lapply(1:D,function(t){dim(T[[t]])[2]}))        ## Number of random effects
+na = length(unique(Z[,4]))                                  ## Number of assays
+p = sum(pd)
+q = sum(qd)
+psum = cumsum(pd)     ## Find intercepts to exclude from variable selection ##
+qsum = cumsum(qd)     ## Find intercepts to exclude from variable selection ##
+intB = c(1,psum[-D]+1)
+intL = c(1,qsum[-D]+1)	
+
+#######################
+#######################
+## Compute only once ##
+XTX = createXTX(X,D)
+
+#######################
+#######################
+## Hyperparameters ##
+Phi = 100*diag(p)                       ## Covariance matrix for slab prior on beta
+iPhi = solve(Phi)                      
+Psi = 100*diag(q)                       ## Covariance matrix for slab prior on lambda
+iPsi = solve(Psi)
+C0 = 0.5 * diag(sum(qd*(qd-1)/2))	## prior covariance for A matrices
+IC0 = solve(C0)
+mSi = solve(mS)			        ## W prior scale matrix inverse
+av = bv = aw = bw = 1                   ## Hyperparameters for mixing weights
+
+################
+################
+## Initialize ##
+beta.list = lambda.list = V.list = A.list = b.list = v.list = w.list = list()
+	for(d in 1:D){
+		# Provide Informative starting values for fixed effects
+                fit<-glmer(Y[,d] ~ X[[d]][,-1] + (1 | Y[,4]), family = binomial(link = "probit"))
+                beta.list[[d]] = fixef(fit)
+		 
+		v.list[[d]] = rep(1,pd[d])     # Everything starts active
+                w.list[[d]] = rep(1,qd[d])     # Everything starts active 
+
+		lambda.list[[d]] = rep(0.01,qd[d])	
+		V.list[[d]] = diag(rep(0.01,qd[d]))		## can't intialize with 0 because of vli below
+		A.list[[d]] = diag(qd[d])
+		A.list[[d]][lower.tri(A.list[[d]])] = 0.01	## can't initalize with 0 or 1 because of ali below
+		b.list[[d]] = matrix(.01, K, qd[d])
+	}
+
+v<-unlist(v.list)
+w<-unlist(w.list)
+beta<-unlist(beta.list)
+lambda<-unlist(lambda.list)
+omega = Y[,1:D] - (1-Y[,1:D])
+
+tau_v = rep(0.5,p)
+tau_w = rep(0.5,q)
+W = diag(D)
+S = diag(diag(W))
+R = solve(S^(1/2)) %*% W %*% solve(S^(1/2))
+iR = solve(R)
+
+##################################################################
+# Precompute a few things
+XB = do.call(cbind,lapply(1:D, listiply, L1 = X, L2 = beta.list))
+TV = lapply(1:D, listiply, L1 = T, L2 = V.list)
+TVA = lapply(1:D, listiply, L1 = TV, L2 = A.list)
+TVAb = matrix(0, N, D)
+TVAb = createTVAb(N,D,qd,TVAb,TVA,b.list,Y[,D+2])
+eta = XB + TVAb
+	
+tmp = as.relistable(V.list)
+tmp1 = unlist(tmp)
+vli = which(tmp1 != 0)
+
+tmp = as.relistable(A.list)
+tmp1 = unlist(tmp)
+ali = which(tmp1 != 0 & tmp1 != 1)
+	
+####################################
+## Saving devices
+	Beta = matrix(-99, iters, p)
+	vv = matrix(-99, iters, p)
+	Lambda = matrix(-99, iters, q)
+	ww = matrix(-99, iters, q)
+	aa = matrix(-99, iters, sum(qd*(qd-1)/2))
+	bb = array(-99, c(K,q,iters))
+	DD = list()
+	for(d in 1:D){
+		DD[[d]] = array(-99, c(qd[d], qd[d], iters))
+	}
+	RR = array(-99, c(D,D,iters))
+	SE = SP = array(-99, c(na,D,iters))
+	Tau_v = matrix(-99, iters, p)
+	Tau_w = matrix(-99, iters, q)
+	bmat = matrix(-99, K, q)
+        accR = 0
+
+
+## Log likelihood function with beta integrated out ##
+	like_v = function(v,ell){
+		tmp = as.relistable(v.list)
+		tmp1 = unlist(tmp)
+		tmp1[1:p] = v
+		v.list = relist(tmp1)
+		Xa = lapply(1:D, function(d){X[[d]][,v.list[[d]]==1]})
+		XaTXa = createXTX(Xa,D)
+		pda = do.call(append,lapply(v.list,sum))
+		rows = rep(1:D, pda)
+		XaiRXa = iR[rows,rows] * XaTXa
+		iRh = iR %*% t(omega - TVAb)
+		XaiRh = NULL
+		for(d in 1:D){
+			if(pda[d] == 1){XaiRh = c(XaiRh, sum(Xa[[d]] * iRh[d,]))}
+			if(pda[d] > 1){XaiRh = c(XaiRh, apply(Xa[[d]] * iRh[d,], 2, sum))}	
+		}
+		sigma = XaiRXa  + iPhi[v==1,v==1]
+		Isigma = solve(sigma)
+		Isigma = (Isigma + t(Isigma)) / 2
+		mu = Isigma %*% XaiRh
+		lval = -(1/2) * log(det(sigma)) + (1/2) * t(mu) %*% sigma %*% mu - (1/2) * log(Phi[ell,ell]) * v[ell]
+		return(lval)
+	}
+
+	## Log likelihood function with wld integrated out ##
+	like_w = function(lambda,ell){
+		d = which(qsum >= ell)[1]
+		record = lambda[ell]
+		lambda[ell] = 0
+		tmp = as.relistable(lambda.list)
+		tmp1 = unlist(tmp)
+		tmp1[1:q] = lambda
+		lambda.list = relist(tmp1)
+		EL = do.call(cbind,lapply(1:D, listiply, L1 = E, L2 = lambda.list))
+		lambda[ell] = record
+		tmp = as.relistable(lambda.list)
+		tmp1 = unlist(tmp)
+		tmp1[1:q] = lambda
+		lambda.list = relist(tmp1)
+		Emat = do.call(cbind,E)
+		E.list = list()
+		E.list[[1]] = E.list[[2]] = rep(0,N)
+		E.list[[d]] = Emat[,ell]
+		Emat2 = createXTX(E.list,D)
+		Emat2iR = Emat2[d,d] * iR[d,d]
+		iRh = iR %*% t(omega - XB - EL)
+		EmatiRh = sum(Emat[,ell] * iRh[d,])	
+		IS_w = solve(Emat2iR + iPsi[ell,ell])
+		mu_w = IS_w * EmatiRh
+		lval = log(sqrt(IS_w) * (1 - pnorm(-mu_w/sqrt(IS_w))) / (sqrt(Psi[ell,ell])/2)) + mu_w^2 / (2*IS_w)
+		return(lval)
+	}
+
+
+
+##########################################################################################
+# RUN MCMC                                                                              ##
+	for(t in 1:iters){
+		
+		## Sample omega ##
+		Lw = ifelse(Y[,1:D]==1, 0, -Inf)
+		Up = ifelse(Y[,1:D]==1, Inf, 0)
+		for(d in 1:D){
+			s21 = R[d,-d]
+			is22 = solve(R[-d,-d])
+			mu_omega = eta[,d] + s21 %*% is22 %*% t(omega[,-d] - eta[,-d])
+			S_omega = 1 - s21 %*% is22 %*% s21
+			omega[,d] = rtruncnorm(N, a = Lw[,d], b = Up[,d], mean = mu_omega, sd = sqrt(S_omega))
+		}
+
+		## Sample v ##
+		mix = sample(1:p, p, replace = FALSE)
+		for(i in mix){
+			if(i %in% intB){next}
+			v[i] = 0
+			lp0 = like_v(v,i)
+			v[i] = 1
+			lp1 = like_v(v,i)
+			p0p1 = exp(lp0 - lp1)
+			prob = 1 / (1 + (1-tau_v[i]) / tau_v[i] * p0p1)
+			v[i] = rbinom(1, 1, prob)
+		}
+		tmp = as.relistable(v.list)
+		tmp1 = unlist(tmp)
+		tmp1[1:p] = v
+		v.list = relist(tmp1)
+
+		## Sample w ##
+		E = createE(N,D,qd,T,Y[,D+2],A.list,b.list)
+		mix = sample(1:q, q, replace = FALSE)
+		for(i in mix){
+			if(i %in% intL){next}
+			lp0 = 0
+			w[i] = 1
+			lp1 = like_w(lambda,i)
+			p0p1 = exp(lp0 - lp1)
+			prob = 1 / (1 + (1-tau_w[i]) / tau_w[i] * p0p1)
+			w[i] = rbinom(1,1,prob)
+		}
+		tmp = as.relistable(w.list)
+		tmp1 = unlist(tmp)
+		tmp1[1:q] = w
+		w.list = relist(tmp1)
+
+		## Update beta ##
+		Xa = lapply(1:D, function(d){X[[d]][,v.list[[d]]==1]})
+		XaTXa = createXTX(Xa,D)
+		pda = do.call(append,lapply(v.list,sum))
+		rows = rep(1:D, pda)
+		XaiRXa = iR[rows,rows] * XaTXa
+		iRh = iR %*% t(omega - TVAb)
+		XaiRh = NULL
+		for(d in 1:D){
+			if(pda[d] == 1){XaiRh = c(XaiRh, sum(Xa[[d]] * iRh[d,]))}
+			if(pda[d] > 1){XaiRh = c(XaiRh, apply(Xa[[d]] * iRh[d,], 2, sum))}	
+		}
+		IS_beta = solve(iPhi[v==1,v==1] + XaiRXa)
+		IS_beta = (IS_beta + t(IS_beta)) / 2
+		mu_beta = IS_beta %*% XaiRh
+		beta[v==0] = 0
+		beta[v==1] = as.vector(rmvnorm(1, mu_beta, IS_beta))
+		tmp = as.relistable(beta.list)
+		tmp1 = unlist(tmp)
+		tmp1[1:p] = beta
+		beta.list = relist(tmp1)
+		XB = do.call(cbind,lapply(1:D, listiply, L1 = X, L2 = beta.list))
+		eta = XB + TVAb
+                #print(beta)
+		
+		## Update lambda ##
+		E = createE(N,D,qd,T,Y[,D+2],A.list,b.list)
+		for(ell in 1:q){
+			if(w[ell] == 0){lambda[ell] = 0; next}
+			d = which(qsum >= ell)[1]
+			record = lambda[ell]
+			lambda[ell] = 0
+			tmp = as.relistable(lambda.list)
+			tmp1 = unlist(tmp)
+			tmp1[1:q] = lambda
+			lambda.list = relist(tmp1)
+			EL = do.call(cbind,lapply(1:D, listiply, L1 = E, L2 = lambda.list))
+			lambda[ell] = record
+			tmp = as.relistable(lambda.list)
+			tmp1 = unlist(tmp)
+			tmp1[1:q] = lambda
+			lambda.list = relist(tmp1)
+			Emat = do.call(cbind,E)
+			E.list = list()
+			E.list[[1]] = E.list[[2]] = rep(0,N)		## NEED TO AUTOMATE THIS
+			E.list[[d]] = Emat[,ell]
+			Emat2 = createXTX(E.list,D)
+			Emat2iR = Emat2[d,d] * iR[d,d]
+			iRh = iR %*% t(omega - XB - EL)
+			EmatiRh = sum(Emat[,ell] * iRh[d,])	
+			sigmasq_lam = solve(Emat2iR + iPsi[ell,ell])
+			mu_lam = sigmasq_lam * EmatiRh
+			lambda[ell] = rtruncnorm(1, a = 0, b = Inf, mean = mu_lam, sd = sqrt(sigmasq_lam))
+		}
+		tmp = as.relistable(V.list)
+		tmp1 = unlist(tmp)
+		tmp1[vli] = lambda
+		V.list = relist(tmp1)
+		TV = lapply(1:D, listiply, L1 = T, L2 = V.list)
+		TVA = lapply(1:D, listiply, L1 = TV, L2 = A.list)
+		TVAb = matrix(0, N, D)
+		TVAb = createTVAb(N,D,qd,TVAb,TVA,b.list,Y[,D+2])
+		eta = XB + TVAb
+		
+		## Update a ##
+		U = createU(N,D,qd,T,Y[,D+2],V.list,b.list)
+		UTU = createXTX(U,D)
+		rows = rep(1:D, qd*(qd-1)/2)
+		UiRU = iR[rows,rows] * UTU
+		TVb = matrix(0, N, D)
+		TVb = createTVb(N,D,qd,TVb,TV,b.list,Y[,D+2])
+		iRh = iR %*% t(omega - XB - TVb)
+		UiRh = NULL
+		for(d in 1:D){
+			UiRh = c(UiRh, apply(U[[d]] * iRh[d,], 2, sum))
+		}
+		IS_a = solve(IC0 + UiRU)
+		IS_a = (IS_a + t(IS_a)) / 2
+		mu_a = IS_a %*% UiRh
+		a = as.vector(rmvnorm(1, mean = as.vector(mu_a), sigma = IS_a, method = "svd"))
+		tmp = as.relistable(A.list)
+		tmp1 = unlist(tmp)
+		tmp1[ali] = a
+		A.list = relist(tmp1)
+		TVA = lapply(1:D, listiply, L1 = TV, L2 = A.list)
+		TVAb = matrix(0, N, D)
+		TVAb = createTVAb(N,D,qd,TVAb,TVA,b.list,Y[,D+2])
+		eta = XB + TVAb
+
+		## Update b ##
+		iRh = iR %*% t(omega - XB)
+		rows = rep(1:D, qd)
+		mix = sample(1:K, K, replace = FALSE)
+		for(k in mix){
+			id = which(Y[,D+2] == k)
+			TskVA = lapply(TVA, '[', id,)
+			TskVA2 = createXTX(TskVA, D)
+
+			TskVAiR2 = iR[rows,rows] * TskVA2
+			TskVAiRh = NULL
+			for(d in 1:D){
+				TskVAiRh = c(TskVAiRh, apply(TskVA[[d]] * iRh[d,id], 2, sum))
+			}
+			IS_b = solve(TskVAiR2 + diag(q))
+			IS_b = (IS_b + t(IS_b)) / 2
+			mu_b = IS_b %*% TskVAiRh
+			bmat[k,] = as.vector(rmvnorm(1, mean = as.vector(mu_b), sigma = IS_b, method = "svd"))
+		}
+		tmp = as.relistable(b.list)
+		tmp1 = unlist(tmp)
+		tmp1[1:(K*q)] = bmat
+		b.list = relist(tmp1)
+		TVAb = matrix(0, N, D)
+		TVAb = createTVAb(N,D,qd,TVAb,TVA,b.list,Y[,D+2])
+		eta = XB + TVAb
+
+		## Update R ##
+		Ws = matrix(rWishart(1, m, W/m), D, D)
+		Ss = diag(diag(Ws))
+		Rs = solve(Ss^(1/2)) %*% Ws %*% solve(Ss^(1/2))
+		alpha = post(omega,eta,Rs,Ss,m0,mSi,D) - post(omega,eta,R,S,m0,mSi,D) + prop(m,W,S,Ws,D) - prop(m,Ws,Ss,W,D)
+		if(alpha > log(runif(1))){
+			R = Rs
+			iR = solve(R)
+			S = Ss
+			W = Ws
+			accR = accR + 1
+		}
+
+		## Update mixing weights ##
+		a1 = v + av
+		b1 = 1 - v + bv
+		a2 = w + aw
+		b2 = 1 - w + bw
+		tau_v = rbeta(p, a1, b1)
+		tau_w = rbeta(q, a2, b2)
+
+		
+		## Update Y using marginals and one joint - fast ##
+		if(D == 2){
+			marg1 = pnorm(eta[,1])
+			marg2 = pnorm(eta[,2])
+			args = cbind(-Inf,-Inf,eta[,1],eta[,2])
+			joint = apply(args, 1, pmvt_C, mean = rep(0,D), sigma = R, D = D)
+			last = 1 - marg1 - (marg2 - joint)
+			for(d in 1:D){
+				Yd = Y[,1:D]
+				p1_marg = (d==1)*marg1 + (d==2)*marg2
+				p0_marg = (d==2)*marg1 + (d==1)*marg2
+				p1 = (1 - Yd[,-d]) * (p1_marg - joint) + Yd[,-d] * joint
+				p0 = (1 - Yd[,-d]) * last + Yd[,-d] * (p0_marg - joint)
+				newY = rep(0,N)
+				ru = runif(N)
+				Ytmp = Y[,c(d,(D+1):dim(Y)[2])]
+                        	Ztmp = Z[,c(d,(D+1):dim(Z)[2])]
+                                #print(Se)
+                                #print(Sp)
+				Y[,d] = samplelatents(N, p1, p0, Ytmp, Ztmp, newY, ru, Se[,d], Sp[,d])
+			}
+		}
+
+		## Update Se and Sp ##
+		if(est.error == TRUE){
+			for(d in 1:D){
+				PSe = PSp = matrix(0, nrow = na, ncol = 2)
+				res = errorupdates(N, J, Y[,c(d,(D+1):dim(Y)[2])], Z[,c(d,(D+1):dim(Z)[2])], PSe, PSp, na)
+				#print(res)
+                                Se.up = res$PSe
+				Sp.up = res$PSp
+                                #print(cbind(c(d,t),Se.up))
+                                #print(cbind(c(d,t),Sp.up))
+				for(i in 1:na){
+					Se[i,d] = rbeta(1, ase[i,d] + Se.up[i,1], bse[i,d] + Se.up[i,2])
+					Sp[i,d] = rbeta(1, asp[i,d] + Sp.up[i,1], bsp[i,d] + Sp.up[i,2])
+				}
+			}
+		}
+				
+		## Save ##
+		Beta[t,] = beta
+		vv[t,] = v
+		Lambda[t,] = lambda
+		ww[t,] = w
+		aa[t,] = a
+		bb[,,t] = do.call(cbind,b.list)
+		RR[,,t] = R
+		SE[,,t] = Se
+		SP[,,t] = Sp
+		for(d in 1:D){
+			tmp = V.list[[d]] %*% A.list[[d]] %*% t(A.list[[d]]) %*% V.list[[d]]
+			DD[[d]][,,t] = tmp
+		}
+		Tau_v[t,] = tau_v
+		Tau_w[t,] = tau_w
+		if(verbose == TRUE){
+			par(mfrow = c(4, 3))
+			plot(Beta[1:t,1])
+			plot(Beta[1:t,2])
+			plot(Beta[1:t,3])
+			plot(Beta[1:t,4])
+			plot(Lambda[1:t,1])
+			plot(Lambda[1:t,2])
+			plot(Lambda[1:t,4])
+			plot(Lambda[1:t,5])
+			plot(aa[1:t,1])
+			plot(bb[1,1,1:t])
+			plot(bb[1,2,1:t])
+			plot(RR[1,2,1:t])
+		}
+		
+	}
+	accR = accR / iters
+	return(list("beta"=Beta,"v"=vv,"lambda"=Lambda,"w"=ww,"a"=aa,"b"=bb,"R"=RR,"accR"=accR,"se"=SE,"sp"=SP,"D"=DD,"tauv"=Tau_v,"tauw"=Tau_w))
+}
+
+
+
+
+###################################################################################################
+###################################################################################################
+#####
+#####	Multiplies elements of a list together, called with lapply
+#####
+###################################################################################################
+###################################################################################################
+listiply = function(i,L1,L2){
+	L1[[i]] %*% L2[[i]]
+}
+
+
+
+###################################################################################################
+###################################################################################################
+#####
+##### Used to update the parameters of full conditional of Se and Sp
+#####
+###################################################################################################
+###################################################################################################
+errorupdates<-function(N,K,Y,G,PSe,PSp,na) {
+
+	for(k in 1:K){
+		Ysum = 0
+		Gk = G[k,1]
+		ck = G[k,2]
+		as = G[k,3]	
+		for(i in 1:ck){
+			tmp = G[k,i+3]
+			Ysum = Ysum+Y[tmp,1]
+		}
+		if(Ysum > 0){
+			if(Gk > 0){
+				PSe[as,1] = PSe[as,1]+ 1
+                        }
+			else{
+				PSe[as,2] = PSe[as,2]+ 1
+                        }
+		}
+		else{
+			if(Gk > 0){
+				PSp[as,2] = PSp[as,2]+1;	
+                        }
+			else{
+				PSp[as,1] = PSp[as,1]+ 1;	
+                        }
+		}
+	}
+
+	return(list("PSe"=PSe, "PSp"=PSp))
+}
+
+###################################################################################################
+###################################################################################################
+#####
+#####	Multiplies design matrices together from a list
+#####
+###################################################################################################
+###################################################################################################
+createXTX = function(x,D){
+	xtx = NULL
+	for(d1 in 1:D){
+		cols = NULL
+		for(d2 in 1:D){
+			tmp = t(x[[d1]]) %*% x[[d2]]
+			cols = cbind(cols,tmp)
+		}
+		xtx = rbind(xtx,cols)
+	}
+	return(xtx)
+}
+
+
+
+
+
+###################################################################################################
+###################################################################################################
+#####
+##### Parameter extended Metropolis hastings algorithm for R
+#####
+###################################################################################################
+###################################################################################################
+post = function(omega,eta,rr,dd,m0,mSi,D){
+	w = dd^(1/2) %*% rr %*% dd^(1/2)
+	pv = (m0-D-1)/2 * log(det(rr)) + (m0/2-1) * log(det(dd)) + sum(diag(-(1/2) * mSi %*% w))
+	like = sum(dmnorm(omega, eta, rr, log = TRUE))
+	val = pv + like
+	return(val)
+}
+prop = function(m,evalw,evald,parw,D){
+	jacob = (D-1)/2 * sum(log(diag(evald)))
+	val = jacob + dWishart(evalw,m,parw/m,log=TRUE)
+	return(val)
+}
+
+
+
+
+
+###################################################################################################
+###################################################################################################
+#####
+#####	To vectorize multivariate normal distribution using apply function
+#####
+###################################################################################################
+###################################################################################################
+rmvtnorm.alt = function(x, s){
+	val = rmvnorm(1, x, s)
+	return(val)
+}
+dmvtnorm.alt = function(x, D, r){
+	mean = x[(D+1):(2*D)]
+	x = matrix(x[1:D], 1, D)
+	dec = chol(r)
+	p = length(x)
+	tmp = backsolve(dec, t(x) - mean, transpose = TRUE)
+	rss = colSums(tmp ^ 2)
+	logretval = - sum(log(diag(dec))) - 0.5 * p * log(2 * pi) - 0.5 * rss
+	return(logretval)
+}
+isInf = function(x) x > 0 & is.infinite(x) 	# check for  Inf
+isNInf = function(x) x < 0 & is.infinite(x) 	# check for -Inf
+pmvt_C = function(args, mean, sigma, D){
+	lower = args[1:D]
+	upper = args[(D+1):(2*D)]
+	lower = (lower - mean) / sqrt(diag(sigma))
+	upper = (upper - mean) / sqrt(diag(sigma))
+	mean = rep(0, length(lower))
+	corr = cov2cor(sigma)
+	n = ncol(corr)
+	df = 0
+	delta = mean
+	infin = rep(2, n)
+	infin[isInf(upper)] = 1
+	infin[isNInf(lower)] = 0
+	infin[isNInf(lower) & isInf(upper)] = -1
+	corrF = matrix(as.vector(corr), ncol = n, byrow = TRUE)
+  	corrF = corrF[upper.tri(corrF)]
+	lower[isNInf(lower)] = 0
+  	upper[isInf(upper)] = 0
+ 	error = 0; value = 0; inform = 0
+  	maxpts = 25000; abseps = 0.001; releps = 0
+	.C("C_mvtdst",
+     		N = as.integer(n),
+     		NU = as.integer(df),
+     		LOWER = as.double(lower),
+     		UPPER = as.double(upper),
+     		INFIN = as.integer(infin),
+     		CORREL = as.double(corrF),
+     		DELTA = as.double(delta),
+     		MAXPTS = as.integer(maxpts),
+     		ABSEPS = as.double(abseps),
+     		RELEPS = as.double(releps),
+     		error = as.double(error),
+     		value = as.double(value),
+     		inform = as.integer(inform),
+     		RND = as.integer(1)
+	)$value
+}
+
+
+
+
+
+
+###################################################################################################
+###################################################################################################
+#####
+#####	Dorfman and Array testing for multiple responses
+#####	Input: 
+#####	Ytrue - matrix of true statuses, 
+#####	Se - sensitivity vector for all diseases being tested
+#####	Sp - specificity vector for all diseases being tested
+#####	cj - group size scalar
+#####	Output: Z - matrix of group responses with jth row (outcome, group size, assay used, individuals in group)
+#####	             Y - matrix of individual diagonsis with ith row (0 for initialization, number of pools invovled in, pool ids)
+#####
+###################################################################################################
+###################################################################################################
+MRGT.Dorfman.decode.same.error = function(N, D, Ytrue, Se, Sp, cj){
+	Jmax = N + N / cj
+	J = 1
+	Y = matrix(-99, N, D + 4)
+	Z = matrix(-99, Jmax, D + cj + 2)
+
+	for(j in 1:(N/cj)){
+		id = ((j-1)*cj+1):(j*cj)
+		if(D == 1){return("D should be larger than 1")}
+		if(D > 1){prob = ifelse(apply(Ytrue[id,],2,sum) > 0, Se, 1 - Sp)}
+		Z[J,1:D] = rbinom(D, 1, prob)
+		Z[J,D+1] = cj	## number in pool
+		Z[J,D+2] = 1	## assay used
+		Z[J,(D+3):(D+2+cj)] = id	## individuals in this pool
+		Y[id,D+1] = 1	## number of pools involved in so far
+		Y[id,D+2] = -99	## site id
+		Y[id,D+3] = J	## pool id
+		J = J+1
+		if(sum(Z[J-1,1:D]) > 0){
+			for(k in id){
+				prob = ifelse(Ytrue[k,] > 0, Se, 1 - Sp)
+				Z[J,1:D] = rbinom(D, 1, prob)
+				Z[J,D+1] = 1
+				Z[J,D+2] = 1
+				Z[J,D+3] = k
+				Y[k,D+1] = 2
+				Y[k,D+4] = J
+				J = J+1
+			}
+		}
+	}
+	J = J-1
+	Z = Z[1:J,]
+	return(list("Z" = Z, "Y" = Y))
+}
+
+MRGT.Dorfman.decode.diff.error = function(N, D, Ytrue, Se, Sp, cj){
+	Jmax = N + N / cj
+	J = 1
+	Y = matrix(-99, N, D + 4)
+	Z = matrix(-99, Jmax, D + cj + 2)
+
+	for(j in 1:(N/cj)){
+		id = ((j-1)*cj+1):(j*cj)
+		if(D == 1){return("D should be larger than 1")}
+		if(D > 1){prob = ifelse(apply(Ytrue[id,],2,sum) > 0, Se[1,], 1 - Sp[1,])}
+		Z[J,1:D] = rbinom(D, 1, prob)
+		Z[J,D+1] = cj	## number in pool
+		Z[J,D+2] = 1		## assay used
+		Z[J,(D+3):(D+2+cj)] = id	## individuals in this pool
+                Y[id,1:D] = 0
+		Y[id,D+1] = 1	## number of pools involved in so far
+		Y[id,D+2] = -99	## site id
+		Y[id,D+3] = J	## pool id
+		J = J+1
+		if(sum(Z[J-1,1:D]) > 0){
+			for(k in id){
+				prob = ifelse(Ytrue[k,] > 0, Se[2,], 1 - Sp[2,])
+				Z[J,1:D] = rbinom(D, 1, prob)
+				Z[J,D+1] = 1
+				Z[J,D+2] = 2
+				Z[J,D+3] = k
+                                Y[k,1:D] = Z[J,1:D]
+				Y[k,D+1] = 2
+				Y[k,D+4] = J
+				J = J+1
+			}
+		}
+	}
+	J = J-1
+	Z = Z[1:J,]
+	return(list("Z" = Z, "Y" = Y))
+}
+
+MRGT.Array.decode.same.error = function(N, D, Ytrue, Se, Sp, cj){
+	Jmax = 2 * N / cj + N
+	J = 1
+	AT = N / cj^2
+	Y = matrix(-99, N, D + 5) 
+	Z = matrix(-99, Jmax, D + cj + 2) 
+
+	Y.A = array(-99, c(cj,cj,D,AT))
+	ID.A = array(-99, c(cj,cj,AT))
+	ind = 1
+	for(i in 1:AT){
+		for(m in 1:cj){
+			for(j in 1:cj){
+				Y.A[m,j,,i] = Ytrue[ind,]
+				ID.A[m,j,i] = ind
+				ind = ind+1
+			}
+		}
+	}
+
+	for(s in 1:AT){
+		array.yk = Y.A[,,,s]
+		array.id = ID.A[,,s]
+
+		a = matrix(0, D, nrow(array.yk))
+		b = matrix(0, D, ncol(array.yk))
+
+		for(i in 1:cj){
+			for(d in 1:D){
+   				prob = ifelse(sum(array.yk[i,,d])>0, Se[d], 1-Sp[d])
+   				g = rbinom(1,1,prob)
+   				a[d,i] = g
+   				Z[J,d] = g
+			}
+			Z[J,D+1] = cj 			## number in pool
+   			Z[J,D+2] = 1			## assay used
+   			Z[J,(D+3):(D+2+cj)] = array.id[i,]	## individuals in pool
+   			Y[array.id[i,],D+1] = 1		## number of pools involved in so far
+   			Y[array.id[i,],D+2] = -99		## site id
+			Y[array.id[i,],D+3] = J		## pool id	
+   			J = J+1
+		}
+		for(j in 1:cj){
+			for(d in 1:D){
+				prob = ifelse(sum(array.yk[,j,d])>0, Se[d], 1-Sp[d])
+   				g = rbinom(1,1,prob)
+   				b[d,j] = g
+   				Z[J,d] = g 
+			}
+   			Z[J,D+1] = cj 
+   			Z[J,D+2] = 1
+   			Z[J,(D+3):(D+2+cj)] = array.id[,j]
+			Y[array.id[,j],D+1] = 2
+   			Y[array.id[,j],D+4] = J
+   			J = J+1
+		}
+
+		aa = apply(a,2,max)
+		bb = apply(b,2,max)
+		if(sum(aa)>0 & sum(bb)>0){
+			Jold = J
+			for(d in 1:D){
+				array.yk1 = as.matrix(array.yk[(aa==1),(bb==1),d])
+				array.id1 = as.matrix(array.id[(aa==1),(bb==1)])
+				for(i in 1:nrow(array.yk1)){
+					for(j in 1:ncol(array.yk1)){
+  						prob = ifelse(array.yk1[i,j]>0, Se[d], 1-Sp[d])
+   						g = rbinom(1,1,prob)
+   						Z[J,d] = g 
+   						Z[J,D+1] = 1 
+   						Z[J,D+2] = 1
+   						Z[J,D+3] = array.id1[i,j]
+   						Y[array.id1[i,j],D+1] = 3
+   						Y[array.id1[i,j],D+5] = J
+						J = J + 1
+					}
+				}
+				if(d < D){J = Jold}
+			}
+		}
+		if(sum(aa)>0 & sum(bb)==0){
+			Jold = J
+			for(d in 1:D){
+				array.yk1 = as.matrix(array.yk[(aa==1),,d])
+				array.id1 = as.matrix(array.id[(aa==1),])
+				for(i in 1:nrow(array.yk1)){
+					for(j in 1:ncol(array.yk1)){
+   						prob = ifelse(array.yk1[i,j]>0, Se[d], 1-Sp[d])
+   						g = rbinom(1,1,prob)
+   						Z[J,d] = g 
+   						Z[J,D+1] = 1 
+   						Z[J,D+2] = 1
+   						Z[J,D+3] = array.id1[i,j]
+   						Y[array.id1[i,j],D+1] = 3
+   						Y[array.id1[i,j],D+5] = J
+   						J = J+1
+					}
+				}
+				if(d < D){J = Jold}
+			}
+		}
+		if(sum(aa)==0 & sum(bb)>0){
+			Jold = J
+			for(d in 1:D){
+				array.yk1 = as.matrix(array.yk[,(bb==1),d])
+				array.id1 = as.matrix(array.id[,(bb==1)])
+				for(i in 1:nrow(array.yk1)){
+					for(j in 1:ncol(array.yk1)){
+   						prob = ifelse(array.yk1[i,j]>0, Se[d], 1-Sp[d])
+   						g = rbinom(1,1,prob)
+   						Z[J,d] = g 
+   						Z[J,D+1] = 1 
+   						Z[J,D+2] = 1
+   						Z[J,D+3] = array.id1[i,j]
+  						Y[array.id1[i,j],D+1] = 3
+   						Y[array.id1[i,j],D+5] = J
+   						J = J+1
+					}
+				}
+				if(d < D){J = Jold}
+			}
+		}
+
+	} ## End s in 1:AT loop
+	J = J-1
+	Z = Z[1:J,]
+
+	return(list("Z"=Z, "Y"=Y))
+}
+
+MRGT.Array.decode.diff.error = function(N, D, Ytrue, Se, Sp, cj){
+	Jmax = 2 * N / cj + N
+	J = 1
+	AT = N / cj^2
+	Y = matrix(-99, N, D + 5) 
+	Z = matrix(-99, Jmax, D + cj + 2) 
+
+	Y.A = array(-99, c(cj,cj,D,AT))
+	ID.A = array(-99, c(cj,cj,AT))
+	ind = 1
+	for(i in 1:AT){
+		for(m in 1:cj){
+			for(j in 1:cj){
+				Y.A[m,j,,i] = Ytrue[ind,]
+				ID.A[m,j,i] = ind
+				ind = ind+1
+			}
+		}
+	}
+
+	for(s in 1:AT){
+		array.yk = Y.A[,,,s]
+		array.id = ID.A[,,s]
+
+		a = matrix(0, D, nrow(array.yk))
+		b = matrix(0, D, ncol(array.yk))
+
+		for(i in 1:cj){
+			for(d in 1:D){
+   				prob = ifelse(sum(array.yk[i,,d])>0, Se[1,d], 1-Sp[1,d])
+   				g = rbinom(1,1,prob)
+   				a[d,i] = g
+   				Z[J,d] = g
+			}
+			Z[J,D+1] = cj 			## number in pool
+   			Z[J,D+2] = 1			## assay used
+   			Z[J,(D+3):(D+2+cj)] = array.id[i,]	## individuals in pool
+   			Y[array.id[i,],D+1] = 1		## number of pools involved in so far
+   			Y[array.id[i,],D+2] = -99		## site id
+			Y[array.id[i,],D+3] = J		## pool id	
+   			J = J+1
+		}
+		for(j in 1:cj){
+			for(d in 1:D){
+				prob = ifelse(sum(array.yk[,j,d])>0, Se[1,d], 1-Sp[1,d])
+   				g = rbinom(1,1,prob)
+   				b[d,j] = g
+   				Z[J,d] = g 
+			}
+   			Z[J,D+1] = cj 
+   			Z[J,D+2] = 1
+   			Z[J,(D+3):(D+2+cj)] = array.id[,j]
+			Y[array.id[,j],D+1] = 2
+   			Y[array.id[,j],D+4] = J
+   			J = J+1
+		}
+
+		aa = apply(a,2,max)
+		bb = apply(b,2,max)
+		if(sum(aa)>0 & sum(bb)>0){
+			Jold = J
+			for(d in 1:D){
+				array.yk1 = as.matrix(array.yk[(aa==1),(bb==1),d])
+				array.id1 = as.matrix(array.id[(aa==1),(bb==1)])
+				for(i in 1:nrow(array.yk1)){
+					for(j in 1:ncol(array.yk1)){
+  						prob = ifelse(array.yk1[i,j]>0, Se[2,d], 1-Sp[2,d])
+   						g = rbinom(1,1,prob)
+   						Z[J,d] = g 
+   						Z[J,D+1] = 1 
+   						Z[J,D+2] = 2
+   						Z[J,D+3] = array.id1[i,j]
+   						Y[array.id1[i,j],D+1] = 3
+   						Y[array.id1[i,j],D+5] = J
+						J = J + 1
+					}
+				}
+				if(d < D){J = Jold}
+			}
+		}
+		if(sum(aa)>0 & sum(bb)==0){
+			Jold = J
+			for(d in 1:D){
+				array.yk1 = as.matrix(array.yk[(aa==1),,d])
+				array.id1 = as.matrix(array.id[(aa==1),])
+				for(i in 1:nrow(array.yk1)){
+					for(j in 1:ncol(array.yk1)){
+   						prob = ifelse(array.yk1[i,j]>0, Se[2,d], 1-Sp[2,d])
+   						g = rbinom(1,1,prob)
+   						Z[J,d] = g 
+   						Z[J,D+1] = 1 
+   						Z[J,D+2] = 2
+   						Z[J,D+3] = array.id1[i,j]
+   						Y[array.id1[i,j],D+1] = 3
+   						Y[array.id1[i,j],D+5] = J
+   						J = J+1
+					}
+				}
+				if(d < D){J = Jold}
+			}
+		}
+		if(sum(aa)==0 & sum(bb)>0){
+			Jold = J
+			for(d in 1:D){
+				array.yk1 = as.matrix(array.yk[,(bb==1),d])
+				array.id1 = as.matrix(array.id[,(bb==1)])
+				for(i in 1:nrow(array.yk1)){
+					for(j in 1:ncol(array.yk1)){
+   						prob = ifelse(array.yk1[i,j]>0, Se[2,d], 1-Sp[2,d])
+   						g = rbinom(1,1,prob)
+   						Z[J,d] = g 
+   						Z[J,D+1] = 1 
+   						Z[J,D+2] = 2
+   						Z[J,D+3] = array.id1[i,j]
+  						Y[array.id1[i,j],D+1] = 3
+   						Y[array.id1[i,j],D+5] = J
+   						J = J+1
+					}
+				}
+				if(d < D){J = Jold}
+			}
+		}
+
+	} ## End s in 1:AT loop
+	J = J-1
+	Z = Z[1:J,]
+
+	return(list("Z"=Z, "Y"=Y))
+}
+
+
+
+
+
